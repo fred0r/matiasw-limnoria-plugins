@@ -24,6 +24,7 @@ The ONLY gluten-free plugin for displaying link titles.
 - Additional information about [vimeo](https://vimeo.com) links
 - Additional information about [DailyMotion](https://dailymotion.com) links
 - Additional information about [Coub](https://coub.com) links
+- Additional information about [HackerNews](https://news.ycombinator.com) links
 - Article extracts from [Wikipedia](https://en.wikipedia.org) links
 - Rate limiting to mitigate abuse
 - Configurable white/black list to control where titles are disabled

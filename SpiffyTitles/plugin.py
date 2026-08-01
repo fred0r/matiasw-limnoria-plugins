@@ -172,6 +172,7 @@ class SpiffyTitles(callbacks.Plugin):
         self.add_dailymotion_handlers()
         self.add_wikipedia_handlers()
         self.add_reddit_handlers()
+        self.add_hackernews_handlers()
         self.add_vredd_handlers()
         self.add_twitch_handlers()
         self.add_twitter_handlers()
@@ -199,6 +200,10 @@ class SpiffyTitles(callbacks.Plugin):
     def add_reddit_handlers(self):
         self.handlers["reddit.com"] = self.handler_reddit
         self.handlers["www.reddit.com"] = self.handler_reddit
+
+    def add_hackernews_handlers(self):
+        self.handlers["news.ycombinator.com"] = self.handler_hackernews
+        self.handlers["ycombinator.com"] = self.handler_hackernews
 
     def add_vredd_handlers(self):
         self.handlers["v.redd.it"] = self.handler_vredd
@@ -2085,6 +2090,80 @@ class SpiffyTitles(callbacks.Plugin):
         else:
             self.log.debug("SpiffyTitles: falling back to default handler")
             return self.handler_default(url, channel, network)
+
+    def handler_hackernews(self, url, info, channel, network):
+        """
+        Queries the Hacker News API for item titles and comment pages.
+        """
+        self.log.debug("SpiffyTitles: calling hackernews handler for %s" % (url,))
+        item_id = None
+        if info.path == "/item":
+            params = dict(parse_qsl(info.query))
+            item_id = params.get("id")
+        elif info.path.startswith("/item/"):
+            item_id = info.path.split("/")[-1]
+        if not item_id or not re.match(r"^\d+$", item_id):
+            self.log.debug("SpiffyTitles: could not parse Hacker News item id from %s" % (url,))
+            return self.handler_default(url, channel, network)
+
+        headers = self.get_headers(channel, network)
+        api_url = "https://hacker-news.firebaseio.com/v0/item/%s.json" % item_id
+        self.log.debug("SpiffyTitles: requesting %s" % api_url)
+        try:
+            request = requests.get(
+                api_url,
+                headers=headers,
+                timeout=self.timeout,
+                proxies=self.proxies,
+            )
+            request.raise_for_status()
+            item = json.loads(request.content.decode())
+        except (requests.exceptions.RequestException, requests.exceptions.HTTPError) as e:
+            log.error("SpiffyTitles: Hacker News Error: {0}".format(e))
+            return self.handler_default(url, channel, network)
+
+        if not item:
+            self.log.debug("SpiffyTitles: Hacker News API returned no data for %s" % item_id)
+            return self.handler_default(url, channel, network)
+
+        # Follow comment/pollopt parents to the story/poll/job title.
+        item_type = item.get("type")
+        while item_type in ("comment", "pollopt") and item.get("parent"):
+            parent_id = item["parent"]
+            parent_api_url = "https://hacker-news.firebaseio.com/v0/item/%s.json" % parent_id
+            self.log.debug("SpiffyTitles: requesting parent item %s" % parent_api_url)
+            try:
+                request = requests.get(
+                    parent_api_url,
+                    headers=headers,
+                    timeout=self.timeout,
+                    proxies=self.proxies,
+                )
+                request.raise_for_status()
+                item = json.loads(request.content.decode())
+            except (requests.exceptions.RequestException, requests.exceptions.HTTPError) as e:
+                log.error("SpiffyTitles: Hacker News Error fetching parent item: {0}".format(e))
+                break
+            if not item:
+                break
+            item_type = item.get("type")
+
+        title = item.get("title") if item else None
+        if title and item_type in ("story", "poll", "job"):
+            return "%s | Hacker News" % title
+
+        if item_type == "comment":
+            author = item.get("by", "")
+            comment_text = item.get("text", "")
+            comment_text = re.sub(r"\s+", " ", comment_text).strip()
+            if len(comment_text) > 140:
+                comment_text = comment_text[:137].rsplit(" ", 1)[0].rstrip(".,") + "..."
+            if author:
+                return "Comment by %s on Hacker News: %s" % (author, comment_text)
+            return "Hacker News comment: %s" % (comment_text,)
+
+        self.log.debug("SpiffyTitles: Hacker News handler could not build a title for %s" % (url,))
+        return self.handler_default(url, channel, network)
 
     def is_valid_imgur_id(self, input):
         """
