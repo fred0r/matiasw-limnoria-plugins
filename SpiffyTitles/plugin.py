@@ -35,7 +35,7 @@ import supybot.utils as utils
 import supybot.ircdb as ircdb
 import supybot.log as log
 import supybot.conf as conf
-import re, sys, random, time, json, unicodedata, datetime
+import re, sys, random, time, json, unicodedata, datetime, threading
 from urllib.parse import urlparse, parse_qsl, quote, unquote
 from jinja2 import Template
 import requests
@@ -65,6 +65,9 @@ except ImportError:
     _ = lambda x: x
 
 
+_ARCHIVE_CHALLENGE = object()
+
+
 class SpiffyTitles(callbacks.Plugin):
     """Displays link titles when posted in a channel"""
 
@@ -77,6 +80,9 @@ class SpiffyTitles(callbacks.Plugin):
         self.link_cache = {}
         self.handlers = {}
         self.timeout = self.registryValue("timeout")
+        self._archive_lock = threading.Lock()
+        self._archive_session_cookie = None
+        self._archive_session_expiry = 0
         self.add_handlers()
         self.proxies = {}
         self.proxies["http"] = None
@@ -104,6 +110,24 @@ class SpiffyTitles(callbacks.Plugin):
         self.add_vredd_handlers()
         self.add_twitch_handlers()
         self.add_twitter_handlers()
+        self.add_archive_handlers()
+
+    def add_archive_handlers(self):
+        """
+        Adds handlers for archive.today snapshot links.  A snapshot is
+        accessible from any of the mirrors by its path, so a single
+        handler is used for all of them.
+        """
+        for domain in (
+            "archive.md",
+            "archive.ph",
+            "archive.today",
+            "archive.is",
+            "archive.li",
+            "archive.vn",
+        ):
+            self.handlers[domain] = self.handler_archive
+            self.handlers["www." + domain] = self.handler_archive
 
     def add_twitter_handlers(self):
         self.handlers["twitter.com"] = self.handler_twitter
@@ -2112,6 +2136,271 @@ class SpiffyTitles(callbacks.Plugin):
             return title
         else:
             return self.handler_default(url, channel, network)
+
+    def handler_archive(self, url, info, channel, network):
+        """
+        Handles archive.today snapshot links (archive.md, archive.ph,
+        archive.today, archive.is, archive.li, archive.vn).
+
+        archive.today serves a Google reCAPTCHA challenge (HTTP 429) to
+        scripted clients for snapshot pages.  If a solved session cookie is
+        already known it is reused; otherwise, if a captcha solving service
+        is configured, the challenge is solved once and the resulting session
+        cookie cached.  Failures are silent.
+        """
+        if not self.registryValue("archive.enabled", channel=channel, network=network):
+            return self.handler_default(url, channel, network)
+        if "?" in url:
+            url = url.split("?")[0]
+        path = info.path
+        if not path or path == "/":
+            return None
+        headers = self.get_headers(channel, network)
+        cookie = self.get_archive_cookie(channel, network)
+        solved = False
+        mirrors = self.get_archive_mirrors()
+        i = 0
+        while i < len(mirrors):
+            target = "https://%s%s" % (mirrors[i], path)
+            result = self.get_archive_page_title(target, headers, cookie, channel, network)
+            if result is _ARCHIVE_CHALLENGE:
+                if not solved:
+                    cookie = self.solve_archive_captcha(target, channel, network)
+                    solved = True
+                    continue
+                i += 1
+                continue
+            i += 1
+            if result is not None:
+                archive_template = Template(
+                    self.registryValue("archive.template", channel=channel, network=network)
+                )
+                return archive_template.render(title=result)
+        return None
+
+    def get_archive_mirrors(self):
+        """
+        Returns the list of archive.today mirror domains.
+        """
+        return [
+            "archive.md",
+            "archive.ph",
+            "archive.today",
+            "archive.is",
+            "archive.li",
+            "archive.vn",
+        ]
+
+    def get_archive_cookie(self, channel, network):
+        """
+        Returns the currently cached archive.today session cookie if it is
+        still valid, or the manually configured one, or None.
+        """
+        with self._archive_lock:
+            if self._archive_session_expiry and self._archive_session_expiry > time.time():
+                return self._archive_session_cookie
+        configured = self.registryValue("archive.cookies")
+        return configured or None
+
+    def get_archive_page_title(self, url, headers, cookie, channel, network):
+        """
+        Fetches the <title> of an archive.today page.
+
+        Returns the title string on success, _ARCHIVE_CHALLENGE when the
+        reCAPTCHA challenge page is served, or None for any other failure.
+        """
+        request_headers = dict(headers)
+        if cookie:
+            request_headers["Cookie"] = cookie
+        try:
+            with requests.get(
+                url,
+                headers=request_headers,
+                timeout=self.timeout,
+                allow_redirects=True,
+                stream=True,
+                proxies=self.proxies,
+            ) as request:
+                if request.status_code == 429:
+                    return _ARCHIVE_CHALLENGE
+                if request.status_code != 200:
+                    return None
+                content_type = request.headers.get("content-type", "").split(";")[0].strip()
+                if content_type not in ("text/html", "application/xhtml+xml"):
+                    return None
+                text = request.content
+        except requests.exceptions.RequestException as e:
+            log.debug("SpiffyTitles: archive.today request error for %s: %s" % (url, e))
+            return None
+        if not text:
+            return None
+        title = self.get_title_from_html(text, channel, network)
+        if not title:
+            return None
+        # Challenge and empty pages carry a trivial <title> such as "archive.ph"
+        trivial = urlparse(url).netloc.lower()
+        if title.strip().lower() in (trivial, "archive"):
+            return None
+        return title
+
+    def solve_archive_captcha(self, url, channel, network):
+        """
+        Solves the archive.today reCAPTCHA challenge for the given URL using
+        the configured captcha solving service and caches the resulting
+        session cookie.
+
+        Returns the session cookie string on success, or None.
+        """
+        service = self.registryValue("archive.captchaService")
+        api_key = self.registryValue("archive.captchaKey")
+        if not service or not api_key:
+            return None
+        with self._archive_lock:
+            if self._archive_session_expiry and self._archive_session_expiry > time.time():
+                return self._archive_session_cookie
+        sitekey = self.get_archive_sitekey(url, channel, network)
+        if not sitekey:
+            return None
+        token = self.request_captcha_token(api_key, url, sitekey)
+        if not token:
+            return None
+        cookie = self.submit_archive_captcha(url, token)
+        if cookie:
+            with self._archive_lock:
+                self._archive_session_cookie = cookie
+                self._archive_session_expiry = time.time() + self.get_cookie_max_age(cookie)
+            log.debug("SpiffyTitles: cached archive.today session cookie")
+        return cookie
+
+    def get_archive_sitekey(self, url, channel, network):
+        """
+        Fetches the challenge page and extracts the reCAPTCHA sitekey.
+        """
+        headers = self.get_headers(channel, network)
+        try:
+            with requests.get(
+                url,
+                headers=headers,
+                timeout=self.timeout,
+                allow_redirects=True,
+                stream=True,
+                proxies=self.proxies,
+            ) as request:
+                if request.status_code != 429:
+                    return None
+                body = request.content.decode("utf-8", "replace")
+        except requests.exceptions.RequestException as e:
+            log.debug("SpiffyTitles: failed to fetch archive.today challenge: %s" % (e))
+            return None
+        match = re.search(r"sitekey['\"]?\s*[:=]\s*['\"]([^'\"]+)['\"]", body)
+        if not match:
+            log.error("SpiffyTitles: could not find reCAPTCHA sitekey in challenge page")
+            return None
+        return match.group(1)
+
+    def request_captcha_token(self, api_key, url, sitekey):
+        """
+        Submits the reCAPTCHA challenge to the configured solving service
+        (2captcha protocol, in.php/res.php) and returns the solved
+        g-recaptcha-response token, or None.
+        """
+        endpoint = self.registryValue("archive.captchaEndpoint").rstrip("/")
+        data = {
+            "key": api_key,
+            "method": "userrecaptcha",
+            "googlekey": sitekey,
+            "pageurl": url,
+            "json": 1,
+        }
+        try:
+            request = requests.post(
+                endpoint + "/in.php", data=data, timeout=self.timeout, proxies=self.proxies
+            )
+            request.raise_for_status()
+            response = json.loads(request.content.decode())
+        except Exception as e:
+            log.error("SpiffyTitles: captcha service in.php error: %s" % (e))
+            return None
+        if response.get("status") != 1:
+            log.error("SpiffyTitles: captcha service error: %s" % (response))
+            return None
+        task_id = response.get("request")
+        deadline = time.time() + 180
+        while time.time() < deadline:
+            time.sleep(5)
+            try:
+                request = requests.get(
+                    endpoint + "/res.php",
+                    params={"key": api_key, "action": "get", "id": task_id, "json": 1},
+                    timeout=self.timeout,
+                    proxies=self.proxies,
+                )
+                request.raise_for_status()
+                response = json.loads(request.content.decode())
+            except Exception as e:
+                log.error("SpiffyTitles: captcha service res.php error: %s" % (e))
+                return None
+            if response.get("status") == 1:
+                return response.get("request")
+            if response.get("request") not in ("CAPCHA_NOT_READY", None):
+                log.error("SpiffyTitles: captcha service reported: %s" % (response))
+                return None
+        log.error("SpiffyTitles: timed out waiting for captcha solve")
+        return None
+
+    def submit_archive_captcha(self, url, token):
+        """
+        Submits the solved token to the challenge endpoint and returns the
+        session cookie set by the server, or None.
+        """
+        info = urlparse(url)
+        challenge_url = "https://%s/cdn-cgi/l/chk_captcha" % info.netloc
+        try:
+            request = requests.post(
+                challenge_url,
+                data={"response": token, "location": url},
+                timeout=self.timeout,
+                allow_redirects=False,
+                proxies=self.proxies,
+            )
+            cookie_header = request.headers.get("set-cookie")
+            if not cookie_header and request.cookies:
+                cookie_header = "; ".join(
+                    "%s=%s" % (c.name, c.value) for c in request.cookies
+                )
+        except requests.exceptions.RequestException as e:
+            log.error("SpiffyTitles: error submitting archive.today captcha: %s" % (e))
+            return None
+        if not cookie_header:
+            log.error("SpiffyTitles: archive.today captcha submit did not set a cookie")
+            return None
+        log.debug("SpiffyTitles: archive.today set session cookie %r" % (cookie_header,))
+        return cookie_header
+
+    def get_cookie_max_age(self, cookie_header):
+        """
+        Extracts the lifetime of a Set-Cookie header in seconds, defaulting
+        to 30 minutes when unknown.
+        """
+        match = re.search(r"Max-Age=(\d+)", cookie_header)
+        if match:
+            return int(match.group(1))
+        match = re.search(r"Expires=([^;]+)", cookie_header)
+        if match:
+            try:
+                expires = datetime.datetime.strptime(
+                    match.group(1), "%a, %d %b %Y %H:%M:%S GMT"
+                )
+                age = int(
+                    (
+                        expires
+                        - datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+                    ).total_seconds()
+                )
+                return max(age, 1)
+            except ValueError:
+                pass
+        return 1800
 
     def t(self, irc, msg, args, query):
         """

@@ -25,6 +25,7 @@ The ONLY gluten-free plugin for displaying link titles.
 - Additional information about [DailyMotion](https://dailymotion.com) links
 - Additional information about [Coub](https://coub.com) links
 - Article extracts from [Wikipedia](https://en.wikipedia.org) links
+- Titles for [archive.today](https://archive.ph) snapshots
 - Rate limiting to mitigate abuse
 - Configurable white/black list to control where titles are disabled
 - MIME type and size info for file links
@@ -304,6 +305,33 @@ Default value: `^ Wikipedia: {{title}} :: {{extract}}`
 `wikipedia.maxChars` - Extract will be cut to this length (including '...').
 
 Default value: 400
+
+### archive.today handler
+
+Handles snapshot links from any archive.today mirror (`archive.md`, `archive.ph`, `archive.today`, `archive.is`, `archive.li`, `archive.vn`).
+
+archive.today serves a Google reCAPTCHA challenge (HTTP 429) to scripted clients for snapshot pages. If the bot can reach the page, the title is scraped directly. Otherwise the plugin can solve the challenge automatically using a captcha solving service that speaks the [2captcha protocol](https://2captcha.com/2captcha-api) (`in.php`/`res.php`), which many services implement.
+
+`archive.enabled` - Whether to show titles for archive.today links.
+
+`archive.template` - Template for archive.today links.
+
+Default value: `^ {{title}}`
+
+`archive.captchaService` - Captcha solving service to use (`2captcha` or a compatible service). Empty to disable captcha solving.
+
+`archive.captchaEndpoint` - Base URL of the captcha solving service.
+
+Default value: `https://2captcha.com`
+
+`archive.captchaKey` - API key for the captcha solving service.
+
+`archive.cookies` - Optional manual fallback: archive.today session cookies (e.g. `qki=...; spc=...`) exported from a browser after solving the CAPTCHA once. The solved session cookie is also cached in memory automatically when captcha solving is enabled.
+
+### Notes on the archive.today handler
+
+- If the page cannot be retrieved (challenge page, network error, or the IP has been rate-limited), the bot stays silent rather than posting an error message.
+- archive.today aggressively rate-limits and can temporarily block (tarpit) IPs that issue bursts of automated requests; a solved session cookie is reused until it expires to minimize solve volume.
 
 ## Other options
 

@@ -713,3 +713,73 @@ conf.registerChannelValue(
         _("""Uses Twitter API to get additional information about twitter.com links"""),
     ),
 )
+
+
+# archive.today configs
+conf.registerGroup(SpiffyTitles, "archive")
+
+# archive enabler
+conf.registerChannelValue(
+    SpiffyTitles.archive,
+    "enabled",
+    registry.Boolean(
+        True, _("""Whether to add additional information about archive.today links""")
+    ),
+)
+
+# archive template
+conf.registerChannelValue(
+    SpiffyTitles.archive,
+    "template",
+    registry.String(
+        "^ {{title}}", _("""Template used for archive.today title responses""")
+    ),
+)
+
+# captcha solving service
+conf.registerGlobalValue(
+    SpiffyTitles.archive,
+    "captchaService",
+    registry.String(
+        "",
+        _(
+            """
+            Captcha solving service to use ('2captcha' or a compatible
+            service). Empty to disable captcha solving.
+            """
+        ),
+    ),
+)
+
+conf.registerGlobalValue(
+    SpiffyTitles.archive,
+    "captchaEndpoint",
+    registry.String(
+        "https://2captcha.com",
+        _("""Base URL of the captcha solving service."""),
+    ),
+)
+
+conf.registerGlobalValue(
+    SpiffyTitles.archive,
+    "captchaKey",
+    registry.String(
+        "", _("""API key for the captcha solving service."""), private=True
+    ),
+)
+
+# manual cookie fallback
+conf.registerGlobalValue(
+    SpiffyTitles.archive,
+    "cookies",
+    registry.String(
+        "",
+        _(
+            """
+            archive.today session cookies (e.g. 'qki=...; spc=...'). Exported
+            from a browser after solving the CAPTCHA once.
+            """
+        ),
+        private=True,
+    ),
+)
