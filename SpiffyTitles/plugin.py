@@ -67,6 +67,17 @@ except ImportError:
 
 _ARCHIVE_CHALLENGE = object()
 
+ARCHIVE_DOMAINS = frozenset(
+    (
+        "archive.md",
+        "archive.ph",
+        "archive.today",
+        "archive.is",
+        "archive.li",
+        "archive.vn",
+    )
+)
+
 
 class SpiffyTitles(callbacks.Plugin):
     """Displays link titles when posted in a channel"""
@@ -118,16 +129,15 @@ class SpiffyTitles(callbacks.Plugin):
         accessible from any of the mirrors by its path, so a single
         handler is used for all of them.
         """
-        for domain in (
-            "archive.md",
-            "archive.ph",
-            "archive.today",
-            "archive.is",
-            "archive.li",
-            "archive.vn",
-        ):
+        for domain in ARCHIVE_DOMAINS:
             self.handlers[domain] = self.handler_archive
             self.handlers["www." + domain] = self.handler_archive
+
+    def is_archive_domain(self, domain):
+        """
+        Returns True if the given host is an archive.today mirror.
+        """
+        return domain.lower().lstrip("www.") in ARCHIVE_DOMAINS
 
     def add_twitter_handlers(self):
         self.handlers["twitter.com"] = self.handler_twitter
@@ -352,7 +362,14 @@ class SpiffyTitles(callbacks.Plugin):
             log.debug("SpiffyTitles: serving link from cache: %s" % (url))
         # If we still don't have a title (default handler disabled or handler
         # returned nothing), attempt to fetch the page and scrape the <title>.
-        if not title and not cached_link:
+        # archive.today serves a reCAPTCHA challenge (HTTP 429) to scripted
+        # clients, so the scrape would only produce an error; the handler
+        # handles that domain and stays silent instead.
+        if (
+            not title
+            and not cached_link
+            and not self.is_archive_domain(domain)
+        ):
             log.debug("SpiffyTitles: no handler/title; falling back to HTML scrape")
             (plain, _) = self.get_source_by_url(url, channel, network)
             return plain
@@ -2182,14 +2199,7 @@ class SpiffyTitles(callbacks.Plugin):
         """
         Returns the list of archive.today mirror domains.
         """
-        return [
-            "archive.md",
-            "archive.ph",
-            "archive.today",
-            "archive.is",
-            "archive.li",
-            "archive.vn",
-        ]
+        return list(ARCHIVE_DOMAINS)
 
     def get_archive_cookie(self, channel, network):
         """
